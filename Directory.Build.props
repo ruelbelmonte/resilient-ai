@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup>
+    <!-- A warning is a defect you have not fixed yet. CI treats them as errors. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+</Project>
