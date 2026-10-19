@@ -10,6 +10,7 @@ public enum ErrorKind
     None,
     Validation,
     Unavailable,
+    ProviderError,
 }
 
 /// <summary>A success carrying a value, or a failure carrying a reason.</summary>

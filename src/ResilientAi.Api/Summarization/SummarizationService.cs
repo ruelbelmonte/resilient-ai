@@ -1,5 +1,8 @@
 using System.Diagnostics;
+using Microsoft.Extensions.Options;
 using Polly;
+using Polly.Registry;
+using Polly.Timeout;
 using ResilientAi.Api.Llm;
 using ResilientAi.Api.Telemetry;
 
@@ -9,32 +12,31 @@ public sealed record SummaryResult(string Summary, int InputTokens, int OutputTo
 
 /// <summary>
 /// Summarises text via the model, wrapped in the resilience pipeline and the
-/// Result pattern. Transient failures are retried by the pipeline; if they
-/// outlast it, the caller gets a typed Unavailable result, not an exception.
-/// Every outcome is recorded to metrics. See DESIGN.md sections 1 to 3.
+/// Result pattern. Every expected failure (transient errors that outlast the
+/// pipeline, timeouts, provider rejections, missing configuration) comes back as
+/// a typed Result, not an exception. See DESIGN.md sections 1 to 3.
 /// </summary>
 public sealed class SummarizationService
 {
     private const int MaxInputChars = 20_000;
 
-    // claude-sonnet-4-6 list pricing, USD per token. Keep in sync with the model.
-    private const double InputUsdPerToken = 3.0 / 1_000_000;
-    private const double OutputUsdPerToken = 15.0 / 1_000_000;
-
     private readonly ILlmClient _llm;
     private readonly ResiliencePipeline _pipeline;
-    private readonly AiMetrics _metrics;
+    private readonly LlmTelemetry _telemetry;
+    private readonly LlmOptions _options;
     private readonly ILogger<SummarizationService> _logger;
 
     public SummarizationService(
         ILlmClient llm,
-        ResiliencePipeline pipeline,
-        AiMetrics metrics,
+        ResiliencePipelineProvider<string> pipelines,
+        LlmTelemetry telemetry,
+        IOptions<LlmOptions> options,
         ILogger<SummarizationService> logger)
     {
         _llm = llm;
-        _pipeline = pipeline;
-        _metrics = metrics;
+        _pipeline = pipelines.GetPipeline(LlmResilience.PipelineName);
+        _telemetry = telemetry;
+        _options = options.Value;
         _logger = logger;
     }
 
@@ -47,6 +49,8 @@ public sealed class SummarizationService
                 ErrorKind.Validation, $"text exceeds {MaxInputChars} characters");
 
         var prompt = $"Summarise the following text in three sentences:\n\n{text}";
+        var model = _options.Model;
+        using var activity = _telemetry.StartChat(model);
         var started = Stopwatch.GetTimestamp();
         try
         {
@@ -54,21 +58,51 @@ public sealed class SummarizationService
                 async token => await _llm.CompleteAsync(prompt, token),
                 cancellationToken);
 
-            var elapsedMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
-            var cost = response.InputTokens * InputUsdPerToken
-                + response.OutputTokens * OutputUsdPerToken;
-            _metrics.Record(elapsedMs, response.InputTokens, response.OutputTokens, cost, "success");
-
+            _telemetry.RecordSuccess(
+                activity, model, response, Stopwatch.GetElapsedTime(started), CostUsd(response));
             return Result<SummaryResult>.Success(
                 new SummaryResult(response.Text, response.InputTokens, response.OutputTokens));
         }
-        catch (Exception ex) when (ex is TransientLlmException or TimeoutException)
+        catch (TransientLlmException ex)
         {
-            var elapsedMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
-            _metrics.Record(elapsedMs, 0, 0, 0, "unavailable");
-            _logger.LogWarning(ex, "summarisation failed after the resilience pipeline was exhausted");
-            return Result<SummaryResult>.Failure(
+            return Fail(activity, model, started, ex, "unavailable",
                 ErrorKind.Unavailable, "the model is temporarily unavailable");
         }
+        catch (TimeoutRejectedException ex)
+        {
+            return Fail(activity, model, started, ex, "timeout",
+                ErrorKind.Unavailable, "the model did not respond in time");
+        }
+        catch (LlmNotConfiguredException ex)
+        {
+            return Fail(activity, model, started, ex, "not_configured",
+                ErrorKind.Unavailable, "the model provider is not configured");
+        }
+        catch (PermanentLlmException ex)
+        {
+            return Fail(activity, model, started, ex, "provider_error",
+                ErrorKind.ProviderError, "the model provider rejected the request");
+        }
+    }
+
+    private Result<SummaryResult> Fail(
+        Activity? activity, string model, long started, Exception ex,
+        string errorType, ErrorKind kind, string error)
+    {
+        _telemetry.RecordFailure(activity, model, Stopwatch.GetElapsedTime(started), errorType);
+        _logger.LogWarning(ex, "summarisation failed: {ErrorType}", errorType);
+        return Result<SummaryResult>.Failure(kind, error);
+    }
+
+    private double? CostUsd(LlmResponse response)
+    {
+        if (!_options.Pricing.TryGetValue(response.Model, out var price))
+        {
+            _logger.LogWarning("no price configured for model {Model}; cost not recorded", response.Model);
+            return null;
+        }
+
+        return (response.InputTokens * price.InputUsdPerMTok
+            + response.OutputTokens * price.OutputUsdPerMTok) / 1_000_000;
     }
 }
