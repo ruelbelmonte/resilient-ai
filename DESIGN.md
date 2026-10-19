@@ -19,18 +19,41 @@ point; the mapping lives in exactly one place (`Program.cs`).
 
 ## 2. Resilience as an explicit pipeline (Polly)
 
-**Decision.** The model call runs inside a Polly pipeline: retry on
-`TransientLlmException` (3 attempts, exponential backoff from 200ms) then a 30s
-timeout. Only transient failures (5xx, 429, network timeouts) are retried;
-everything else fails fast.
+**Decision.** The model call runs inside one named Polly pipeline (`"llm"`,
+defined once in `LlmResilience.Configure` and registered with
+`AddResiliencePipeline`, so the tests resolve the same pipeline as production).
+From the outside in:
+
+1. a **total timeout** (60s) that bounds the whole request, retries included;
+2. a **retry** on `TransientLlmException` (5xx including 529 overloaded, 429,
+   network errors) and on a per-attempt `TimeoutRejectedException`: 2 retries,
+   so 3 attempts in total, exponential backoff from 200ms with jitter. When the
+   provider sends `Retry-After` on a 429 or 529, that delay is used instead,
+   capped at 10s;
+3. a **per-attempt timeout** (30s).
+
+`HttpClient.Timeout` is disabled so Polly owns every timeout; a finite value
+would race the pipeline and surface as a different exception type. Other 4xx
+and unparseable bodies are `PermanentLlmException` and are not retried. A
+missing API key is `LlmNotConfiguredException`, also not retried. All values
+are configurable under `Llm:Resilience`.
 
 **Rejected.** No retries (one provider hiccup becomes a user-visible error) and
-retry-on-everything (retrying a 400 just wastes time and money).
+retry-on-everything (retrying a 400 just wastes time and money). A single
+timeout, either inside the retry (no bound on the whole request) or outside it
+(one hung attempt eats the whole budget).
 
-**Cost.** Retries add latency to the failure path (up to ~1.4s of backoff before
-giving up) and, in theory, duplicate load on the provider. The attempt count and
-backoff are tunable constants; the right values depend on a real error budget,
-which is noted as an extension.
+**Cost.** Retries add latency to the failure path and duplicate load on the
+provider. With the defaults, a request gives up after at most 60s. Two hung
+attempts consume that budget, so the third attempt only happens when earlier
+failures were fast. The right values depend on a real error budget, which is
+noted as an extension.
+
+**Missing API key.** The service starts without one rather than failing at
+startup: `/health/ready` reports unhealthy so an orchestrator holds traffic, and
+`/summarize` returns 503 with `"the model provider is not configured"`. Failing
+fast at startup was rejected because it would also take down liveness and make
+the misconfiguration harder to see from outside.
 
 **Soft spot, stated honestly.** There is no circuit breaker yet, so under a
 sustained provider outage every request still pays the full retry cost before
@@ -39,18 +62,34 @@ baseline small rather than ship a half-tuned one.
 
 ## 3. Token and cost metrics as first-class
 
-**Decision.** Every request records request count, duration, input/output
-tokens, and estimated USD cost, tagged by outcome, via `IMeterFactory` so the
-meter flows through OpenTelemetry. Traces use ASP.NET Core instrumentation plus
-an app activity source.
+**Decision.** Telemetry follows the OpenTelemetry GenAI semantic conventions:
+
+- one `chat {model}` client span per summarisation (`ActivitySource`
+  `ResilientAi`) with `gen_ai.operation.name`, `gen_ai.provider.name`
+  (`anthropic`), `gen_ai.request.model`, `gen_ai.response.model`,
+  `gen_ai.usage.input_tokens` and `gen_ai.usage.output_tokens`, plus
+  `error.type` and an error status on failure. Each HTTP attempt shows up as a
+  child span through HttpClient instrumentation, so retries are visible;
+- `gen_ai.client.token.usage` (tagged `gen_ai.token.type` input/output) and
+  `gen_ai.client.operation.duration` in seconds (tagged `error.type` on
+  failure). Duration covers the whole pipeline, retries included;
+- `resilientai.llm.cost` in USD, tagged with the model, computed from per-model
+  list prices in `Llm:Pricing`. A model with no price records no cost and logs
+  a warning, rather than reporting a wrong number.
+
+Prompt and completion text are never put on spans or metrics: they are user
+content.
 
 **Rejected.** Logging token counts as text, or not tracking cost at all. An LLM
-service whose spend you cannot graph is not operable; cost is a first-class
-signal here, not an afterthought.
+service whose spend you cannot graph is hard to operate. Hardcoded prices were
+also rejected: they silently go wrong when the model changes.
 
-**Cost.** A small amount of wiring and the discipline of keeping the pricing
-constants in sync with the model. Pricing drift is the obvious failure mode and
-is called out in code.
+**Cost.** Prices are configuration, so they can still drift from the provider's
+list. They were checked against claude.com/pricing on 2026-10-20 and must be
+re-checked when prices or the model change. Only base-tier prices are
+modelled: Claude Haiku 5.5 charges more above 100K prompt tokens, which the
+20,000-character input cap keeps this service well below. Cache and batch
+discounts are not modelled.
 
 ## 4. Export only when a collector is configured
 
@@ -83,3 +122,5 @@ next step with a real tradeoff to reason about:
 - streaming responses (changes the contract and the metrics)
 - a response cache keyed on input (cost win, staleness risk)
 - an eval harness for summary quality (the model's job, not unit-testable)
+- handling `stop_reason` (`refusal`, `max_tokens`): today a 200 with a refusal
+  or a truncated answer is returned as a successful summary
